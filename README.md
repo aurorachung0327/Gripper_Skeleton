@@ -113,8 +113,6 @@ python realtime_hand_skeleton.py --backend wilor-mini
 
 # Example Output
 
-![Skeleton Output](skeleton_example.png)
-
 ### Prediction Format
 
 Each detection returns:
@@ -158,7 +156,7 @@ Explanation:
 ---
 
 # Keypoint Definition
-
+![Skeleton Output](skeleton_example.png)
 ```
 0  Wrist
 
