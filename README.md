@@ -45,7 +45,7 @@ Joints are displayed as **red points**.
 
 Create a Python environment and install dependencies.
 
-> Python version: 3.11.3
+> Python version: 3.11.3  
 > ⚠️ **Note:** `torch` should be installed according to your **GPU / CUDA version**.  
 > Please check the official installation guide:  
 > https://pytorch.org/get-started/locally/
