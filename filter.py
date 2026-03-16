@@ -10,7 +10,7 @@ class EMAFilter:
     Exponential Moving Average filter
     """
 
-    def __init__(self, alpha=0.25):
+    def __init__(self, alpha=0.4):
         self.alpha = alpha
         self.state = None
 
@@ -39,7 +39,7 @@ class OneEuroFilter:
     https://cristal.univ-lille.fr/~casiez/1euro/
     """
 
-    def __init__(self, min_cutoff=2.0, beta=0.0, d_cutoff=1.0, freq=30):
+    def __init__(self, min_cutoff=1.7, beta=0.5, d_cutoff=1.0, freq=30):
 
         self.min_cutoff = min_cutoff
         self.beta = beta
