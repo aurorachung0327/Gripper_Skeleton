@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 import time
 from typing import List, Tuple
 
@@ -14,6 +15,8 @@ import ultralytics.utils
 import ultralytics.utils.loss
 import ultralytics.utils.tal
 import dill
+
+from filter import MultiHandFilter
 
 torch.serialization.add_safe_globals([
     PoseModel,
@@ -61,6 +64,157 @@ HAND_CONNECTIONS = [
 ]
 
 
+def compute_hand_bbox(keypoints: np.ndarray) -> Tuple[int, int, int, int]:
+    pts = np.asarray(keypoints)
+    xy = pts[:, :2].astype(np.int32)
+    x_min, y_min = xy.min(axis=0)
+    x_max, y_max = xy.max(axis=0)
+    return int(x_min), int(y_min), int(x_max), int(y_max)
+
+
+def bbox_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union_area = area_a + area_b - inter_area
+
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def suppress_duplicate_hands(
+    detections: List[Tuple[np.ndarray, str, float]],
+    center_distance_thresh: float = 50.0,
+    iou_thresh: float = 0.4,
+) -> List[Tuple[np.ndarray, str]]:
+    kept = []
+
+    for keypoints, label, score in sorted(detections, key=lambda x: x[2], reverse=True):
+        center = np.asarray(keypoints[:, :2], dtype=np.float32).mean(axis=0)
+        bbox = compute_hand_bbox(keypoints)
+
+        is_duplicate = False
+        for kept_keypoints, kept_label, kept_score, kept_center, kept_bbox in kept:
+            if label != kept_label:
+                continue
+
+            center_distance = np.linalg.norm(center - kept_center)
+            overlap = bbox_iou(bbox, kept_bbox)
+            if center_distance < center_distance_thresh or overlap > iou_thresh:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            kept.append((keypoints, label, score, center, bbox))
+
+    return [(keypoints, label) for keypoints, label, _, _, _ in kept]
+
+
+class JitterEvaluator:
+    def __init__(self, max_match_distance: float = 120.0):
+        self.max_match_distance = max_match_distance
+        self.prev_tracks = {}
+        self.next_track_id = 0
+        self.global_motion_sum = 0.0
+        self.relative_jitter_sum = 0.0
+        self.residual_sum = 0.0
+        self.match_count = 0
+
+    def _compute_center(self, keypoints: np.ndarray) -> np.ndarray:
+        pts = np.asarray(keypoints, dtype=np.float32)
+        return pts[:, :2].mean(axis=0)
+
+    def _compute_relative(self, keypoints: np.ndarray, center: np.ndarray) -> np.ndarray:
+        pts = np.asarray(keypoints, dtype=np.float32)[:, :2]
+        return pts - center
+
+    def update(self, predictions: List[Tuple[np.ndarray, str]]) -> None:
+        if not predictions:
+            self.prev_tracks = {}
+            return
+
+        current = []
+        for keypoints, _ in predictions:
+            center = self._compute_center(keypoints)
+            relative = self._compute_relative(keypoints, center)
+            current.append({
+                "keypoints": keypoints,
+                "center": center,
+                "relative": relative,
+            })
+
+        unmatched_prev = set(self.prev_tracks.keys())
+        assignments = [None] * len(current)
+        candidate_pairs = []
+
+        for curr_idx, item in enumerate(current):
+            for track_id in unmatched_prev:
+                prev_center = self.prev_tracks[track_id]["center"]
+                dist = np.linalg.norm(item["center"] - prev_center)
+                candidate_pairs.append((dist, curr_idx, track_id))
+
+        for dist, curr_idx, track_id in sorted(candidate_pairs, key=lambda x: x[0]):
+            if dist > self.max_match_distance:
+                continue
+            if assignments[curr_idx] is not None or track_id not in unmatched_prev:
+                continue
+
+            assignments[curr_idx] = track_id
+            unmatched_prev.remove(track_id)
+
+        next_tracks = {}
+        for curr_idx, item in enumerate(current):
+            track_id = assignments[curr_idx]
+            if track_id is None:
+                track_id = f"eval_{self.next_track_id}"
+                self.next_track_id += 1
+            else:
+                prev_item = self.prev_tracks[track_id]
+                global_motion = np.linalg.norm(item["center"] - prev_item["center"])
+                relative_delta = item["relative"] - prev_item["relative"]
+                relative_jitter = np.linalg.norm(relative_delta, axis=1).mean()
+
+                self.global_motion_sum += float(global_motion)
+                self.relative_jitter_sum += float(relative_jitter)
+                self.residual_sum += float(max(relative_jitter - global_motion, 0.0))
+                self.match_count += 1
+
+            next_tracks[track_id] = item
+
+        self.prev_tracks = next_tracks
+
+    def summary(self) -> dict:
+        if self.match_count == 0:
+            return {
+                "global_motion": 0.0,
+                "relative_jitter": 0.0,
+                "jitter_ratio": 0.0,
+                "matched_pairs": 0,
+            }
+
+        avg_global_motion = self.global_motion_sum / self.match_count
+        avg_relative_jitter = self.relative_jitter_sum / self.match_count
+        jitter_ratio = avg_relative_jitter / max(avg_global_motion, 1e-6)
+        return {
+            "global_motion": avg_global_motion,
+            "relative_jitter": avg_relative_jitter,
+            "jitter_ratio": jitter_ratio,
+            "matched_pairs": self.match_count,
+        }
+
+
 def draw_hand_skeleton(
     image: np.ndarray,
     keypoints: np.ndarray,
@@ -82,9 +236,10 @@ def draw_hand_skeleton(
     # Draw connections
     # middle three fingers (index, middle, ring)
     RED_CONNECTIONS = {
+        (0,1),(1,2),(2,3),(3,4),
         (0,5),(5,6),(6,7),(7,8),
         (5,9),(9,10),(10,11),(11,12),
-        (9,13),(13,14),(14,15),(15,16)
+        # (9,13),(13,14),(14,15),(15,16)
     }
 
     for i, j in HAND_CONNECTIONS:
@@ -94,21 +249,21 @@ def draw_hand_skeleton(
         if x1 >= 0 and y1 >= 0 and x2 >= 0 and y2 >= 0:
 
             if (i, j) in RED_CONNECTIONS:
-                color = (0, 0, 255)  # 紅色
+                color = (0, 0, 255)
             else:
-                color = (0, 255, 0)  # 綠色
+                color = (0, 0, 255)
 
             cv2.line(image, (x1, y1), (x2, y2), color, 2)
 
     # Draw joints
     for idx, (x, y) in enumerate(xy):
-        cv2.circle(image, (x, y), 3, (0, 0, 255), -1)
+        cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
 
     # Draw bbox + label
     if draw_bbox:
         x_min, y_min = xy.min(axis=0)
         x_max, y_max = xy.max(axis=0)
-        cv2.rectangle(image, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
+        # cv2.rectangle(image, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
 
         if label:
             cv2.putText(
@@ -125,7 +280,7 @@ def draw_hand_skeleton(
 
 
 class MediaPipeHandTracker:
-    def __init__(self, max_num_hands=2, min_detection_conf=0.5, min_tracking_conf=0.5):
+    def __init__(self, max_num_hands=1, min_detection_conf=0.5, min_tracking_conf=0.5):
         import mediapipe as mp
 
         self.mp = mp
@@ -157,12 +312,14 @@ class MediaPipeHandTracker:
                     pts.append([x, y])
 
                 label = ""
+                score = 0.0
                 if handedness is not None and handedness.classification:
                     label = handedness.classification[0].label  # "Left" / "Right"
+                    score = float(handedness.classification[0].score)
 
-                outputs.append((np.array(pts, dtype=np.int32), label))
+                outputs.append((np.array(pts, dtype=np.int32), label, score))
 
-        return outputs
+        return suppress_duplicate_hands(outputs)
 
     def close(self):
         self.hands.close()
@@ -227,6 +384,44 @@ def build_tracker(backend: str):
         raise ValueError(f"Unsupported backend: {backend}")
 
 
+def resolve_video_io(args) -> Tuple[cv2.VideoCapture, cv2.VideoWriter, str, bool]:
+    is_test_mode = bool(args.testmode)
+
+    if is_test_mode:
+        input_path = Path(args.testmode)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input video not found: {input_path}")
+
+        cap = cv2.VideoCapture(str(input_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {input_path}")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or args.width
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or args.height
+        fps = 20.0
+
+        output_path = input_path.with_name(f"{input_path.stem}_{args.filter}_{args.backend}_skeleton.mp4")
+    else:
+        cap = cv2.VideoCapture(args.camera_id)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open camera {args.camera_id}")
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        width = args.width
+        height = args.height
+        fps = 20.0
+        output_path = Path("hand_skeleton_output.mp4")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    video_out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    if not video_out.isOpened():
+        cap.release()
+        raise RuntimeError(f"Cannot create output video: {output_path}")
+
+    return cap, video_out, str(output_path), is_test_mode
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -239,33 +434,42 @@ def main():
     parser.add_argument("--camera_id", type=int, default=0, help="Webcam device index.")
     parser.add_argument("--width", type=int, default=640, help="Camera width.")
     parser.add_argument("--height", type=int, default=360, help="Camera height.")
+    parser.add_argument(
+        "--testmode",
+        type=str,
+        default="",
+        help="Path to an input video. When set, process this video instead of webcam.",
+    )
     parser.add_argument("--show_fps", action="store_true", help="Show FPS on screen.")
     parser.add_argument("--flip", action="store_true", help="Flip image horizontally.")
+    parser.add_argument(
+        "--eval_jitter",
+        action="store_true",
+        help="Evaluate global motion and relative jitter over the processed video.",
+    )
+    parser.add_argument(
+        "--filter",
+        type=str,
+        default="none",
+        choices=["none", "ema", "oneeuro", "kalman"],
+        help="Temporal smoothing filter"
+    )
     args = parser.parse_args()
 
     tracker = build_tracker(args.backend)
-
-    cap = cv2.VideoCapture(args.camera_id)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera {args.camera_id}")
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    # -------- video writer --------
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_out = cv2.VideoWriter(
-        "hand_skeleton_output.mp4",
-        fourcc,
-        10,
-        (args.width, args.height)
-    )
+    filter_manager = MultiHandFilter(args.filter)
+    jitter_evaluator = JitterEvaluator() if args.eval_jitter else None
+    cap, video_out, output_path, is_test_mode = resolve_video_io(args)
 
     prev_time = time.time()
+    total_infer_time = 0.0
+    frame_count = 0
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            print("Failed to read frame from camera.")
+            if not is_test_mode:
+                print("Failed to read frame from camera.")
             break
 
         if args.flip:
@@ -273,17 +477,26 @@ def main():
 
         start = time.time()
         predictions = tracker.predict(frame)
+        # print("raw:", len(predictions))
+        predictions = filter_manager.apply(predictions)
+        # print("filtered:", len(predictions))
         infer_time = time.time() - start
+        total_infer_time += infer_time
+        frame_count += 1
+        if jitter_evaluator is not None:
+            jitter_evaluator.update(predictions)
+
+        now = time.time()
+        fps = 1.0 / max(now - prev_time, 1e-6)
+        prev_time = now
+        filter_manager.update_freq(fps)
 
         vis = frame.copy()
-        print(predictions)
+        # print(predictions)
         for keypoints, label in predictions:
-            vis = draw_hand_skeleton(vis, keypoints, label=label, draw_bbox=True)
+            vis = draw_hand_skeleton(vis, keypoints, draw_bbox=True)
 
         if args.show_fps:
-            now = time.time()
-            fps = 1.0 / max(now - prev_time, 1e-6)
-            prev_time = now
 
             cv2.putText(
                 vis,
@@ -316,17 +529,31 @@ def main():
                 cv2.LINE_AA,
             )
 
-        cv2.imshow("Hand Skeleton Realtime", vis)
         video_out.write(vis)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key in [27, ord("q")]:  # ESC or q
-            break
+        if not is_test_mode:
+            cv2.imshow("Hand Skeleton Realtime", vis)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in [27, ord("q")]:  # ESC or q
+                break
 
     tracker.close()
     cap.release()
     video_out.release()
     cv2.destroyAllWindows()
+
+    avg_infer_ms = (total_infer_time / frame_count * 1000.0) if frame_count else 0.0
+    print(f"Output video saved to: {output_path}")
+    print(f"Average inference time: {avg_infer_ms:.2f} ms over {frame_count} frames")
+    if jitter_evaluator is not None:
+        jitter_stats = jitter_evaluator.summary()
+        print(
+            "Average global motion: "
+            f"{jitter_stats['global_motion']:.3f} px over {jitter_stats['matched_pairs']} matched frame pairs"
+        )
+        print(f"Average relative jitter: {jitter_stats['relative_jitter']:.3f} px")
+        print(f"Jitter/global ratio: {jitter_stats['jitter_ratio']:.3f}")
 
 
 if __name__ == "__main__":

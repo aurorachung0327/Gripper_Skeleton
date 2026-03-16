@@ -17,6 +17,11 @@ It also supports saving the output video for dataset recording or visualization.
 - Middle three fingers highlighted in **red**
 - Bounding box + hand label (**Left / Right**)
 - FPS display
+- Temporal smoothing with `--filter`
+  - `none`
+  - `ema`
+  - `oneeuro`
+  - `kalman`
 - Save output video
 - Webcam input support
 
@@ -107,6 +112,34 @@ python realtime_hand_skeleton.py --backend mediapipe
 
 ```bash
 python realtime_hand_skeleton.py --backend wilor-mini
+```
+
+---
+
+# Temporal Filter
+
+You can enable temporal smoothing with `--filter`.
+
+Available options:
+
+- `none`: no smoothing
+- `ema`: exponential moving average
+- `oneeuro`: One Euro filter
+- `kalman`: constant-velocity Kalman filter
+
+Examples:
+
+```bash
+python realtime_hand_skeleton.py --backend mediapipe --filter none
+python realtime_hand_skeleton.py --backend mediapipe --filter ema
+python realtime_hand_skeleton.py --backend mediapipe --filter oneeuro
+python realtime_hand_skeleton.py --backend mediapipe --filter kalman
+```
+
+For offline testing with video input:
+
+```bash
+python realtime_hand_skeleton.py --backend mediapipe --testmode input.mp4 --filter kalman
 ```
 
 ---
