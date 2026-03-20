@@ -144,6 +144,41 @@ python realtime_hand_skeleton.py --backend mediapipe --testmode input.mp4 --filt
 
 ---
 
+# Game Mode
+
+You can enable rock-paper-scissors response mode with `--game`.
+
+Available options:
+
+- `none`: disable game mode
+- `gripper_win`: the computer shows the gesture that beats the player's gesture
+- `gripper_lose`: the computer shows the gesture that loses to the player's gesture
+
+Behavior:
+
+- Gesture changes are detected from the current hand sign classification
+- The terminal prints the result as `Player: <gesture> -> Computer: <gesture>`
+- A separate `Computer Gesture` window shows the corresponding skeleton animation
+- The main window also overlays `Computer: <gesture>` when game mode is enabled
+
+Examples:
+
+```bash
+python realtime_hand_skeleton.py --backend mediapipe --game gripper_win
+python realtime_hand_skeleton.py --backend mediapipe --game gripper_lose
+python realtime_hand_skeleton.py --backend mediapipe --filter oneeuro --game gripper_win
+```
+
+Gesture mapping:
+
+| Player | `gripper_win` | `gripper_lose` |
+|------|------|------|
+| Stone | Paper | Scissors |
+| Paper | Scissors | Stone |
+| Scissors | Stone | Paper |
+
+---
+
 # Example Output
 
 ### Prediction Format
@@ -253,14 +288,26 @@ python realtime_hand_skeleton.py --flip
 python realtime_hand_skeleton.py --show_fps
 ```
 
+### Disable output video saving
+
+```bash
+python realtime_hand_skeleton.py --no_save_video
+```
+
 ---
 
 # Output Video
 
-The program automatically saves the skeleton overlay video:
+By default, the program saves the skeleton overlay video:
 
 ```
 hand_skeleton_output.mp4
+```
+
+To disable video saving:
+
+```bash
+python realtime_hand_skeleton.py --no_save_video
 ```
 
 Video settings:

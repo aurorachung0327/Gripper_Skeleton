@@ -1,4 +1,6 @@
 import argparse
+import csv
+import json
 from pathlib import Path
 import time
 from typing import List, Tuple
@@ -16,7 +18,9 @@ import ultralytics.utils.loss
 import ultralytics.utils.tal
 import dill
 
+
 from filter import MultiHandFilter
+from model.keypoint_classifier.keypoint_classifier import KeyPointClassifier
 
 torch.serialization.add_safe_globals([
     PoseModel,
@@ -120,6 +124,167 @@ def suppress_duplicate_hands(
             kept.append((keypoints, label, score, center, bbox))
 
     return [(keypoints, label) for keypoints, label, _, _, _ in kept]
+
+
+def pre_process_landmark(landmark_list: np.ndarray) -> List[float]:
+    temp_landmark_list = np.asarray(landmark_list, dtype=np.float32).copy()
+
+    base_x, base_y = temp_landmark_list[0][0], temp_landmark_list[0][1]
+    temp_landmark_list[:, 0] = temp_landmark_list[:, 0] - base_x
+    temp_landmark_list[:, 1] = temp_landmark_list[:, 1] - base_y
+
+    flattened = temp_landmark_list.flatten().tolist()
+    max_value = max(map(abs, flattened), default=0.0)
+    if max_value == 0:
+        return flattened
+
+    return [value / max_value for value in flattened]
+
+
+def classify_hand_sign(
+    landmark_list: np.ndarray,
+    keypoint_classifier: KeyPointClassifier,
+    keypoint_classifier_labels: List[str],
+) -> Tuple[str, float]:
+    pre_processed_landmarks = pre_process_landmark(landmark_list)
+    hand_sign_id, confidence = keypoint_classifier(pre_processed_landmarks)
+    confidence = float(confidence)
+
+    return keypoint_classifier_labels[hand_sign_id], confidence
+
+
+def get_winning_hand(player_gesture: str) -> str:
+    winning_map = {
+        "Stone": "Paper",
+        "Paper": "Scissors",
+        "Scissors": "Stone",
+    }
+    return winning_map.get(player_gesture, "")
+
+
+def get_losing_hand(player_gesture: str) -> str:
+    losing_map = {
+        "Stone": "Scissors",
+        "Paper": "Stone",
+        "Scissors": "Paper",
+    }
+    return losing_map.get(player_gesture, "")
+
+
+def gesture_to_slug(gesture: str) -> str:
+    slug_map = {
+        "Paper": "paper",
+        "Stone": "rock",
+        "Scissors": "scissors",
+    }
+    return slug_map.get(gesture, "")
+
+
+def extract_first_valid_hand_from_frame(frame_data) -> np.ndarray | None:
+    for hand in frame_data:
+        hand_array = np.asarray(hand, dtype=np.float32)
+        if hand_array.shape[0] == 21 and hand_array[0][0] >= 0:
+            return hand_array[:, :2]
+    return None
+
+
+def extract_first_valid_hand_from_json(json_path: Path) -> np.ndarray | None:
+    with json_path.open(encoding="utf-8") as f:
+        frames = json.load(f)
+
+    for frame in frames:
+        hand_array = extract_first_valid_hand_from_frame(frame)
+        if hand_array is not None:
+            return hand_array
+    return None
+
+
+def load_game_skeleton_animations(base_dir: Path) -> dict[str, list[np.ndarray]]:
+    animations = {}
+    for json_path in sorted(base_dir.glob("*_skeleton.json")):
+        animation_key = json_path.stem.replace("_skeleton", "")
+
+        with json_path.open(encoding="utf-8") as f:
+            frames = json.load(f)
+
+        gesture_frames = []
+        for frame in frames:
+            hand_array = extract_first_valid_hand_from_frame(frame)
+            if hand_array is not None:
+                gesture_frames.append(hand_array)
+
+        if gesture_frames:
+            animations[animation_key] = gesture_frames
+    return animations
+
+
+def normalize_hand_for_canvas(keypoints: np.ndarray, canvas_size: int = 360) -> np.ndarray:
+    pts = np.asarray(keypoints, dtype=np.float32)
+    min_xy = pts.min(axis=0)
+    max_xy = pts.max(axis=0)
+    size = np.maximum(max_xy - min_xy, 1.0)
+    scale = min((canvas_size - 80) / size[0], (canvas_size - 100) / size[1])
+
+    normalized = (pts - min_xy) * scale
+    offset = np.array([
+        (canvas_size - (size[0] * scale)) / 2.0,
+        (canvas_size - (size[1] * scale)) / 2.0 + 25.0,
+    ], dtype=np.float32)
+    normalized += offset
+    return normalized
+
+
+def render_game_skeleton_frame(gesture: str, keypoints: np.ndarray, canvas_size: int = 360) -> np.ndarray:
+    canvas = np.full((canvas_size, canvas_size, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        f"Computer: {gesture}",
+        (20, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 128, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    normalized = normalize_hand_for_canvas(keypoints, canvas_size=canvas_size)
+
+    return draw_hand_skeleton(
+        canvas,
+        normalized.astype(np.int32),
+        draw_bbox=False,
+    )
+
+
+class GameSkeletonPlayer:
+    def __init__(self, animations: dict[str, list[np.ndarray]]):
+        self.animations = animations
+        self.current_gesture = ""
+        self.current_animation_key = ""
+        self.frame_index = 0
+
+    def set_gesture(self, gesture: str) -> None:
+        if gesture != self.current_gesture:
+            previous_slug = gesture_to_slug(self.current_gesture)
+            next_slug = gesture_to_slug(gesture)
+            transition_key = f"{previous_slug}_{next_slug}" if previous_slug and next_slug else ""
+
+            self.current_gesture = gesture
+            if transition_key and transition_key in self.animations:
+                self.current_animation_key = transition_key
+            else:
+                self.current_animation_key = next_slug
+            self.frame_index = 0
+
+    def get_frame(self) -> np.ndarray | None:
+        frames = self.animations.get(self.current_animation_key)
+        if not frames:
+            return None
+
+        keypoints = frames[self.frame_index]
+        if self.frame_index < len(frames) - 1:
+            self.frame_index = min(self.frame_index + 3, len(frames) - 1)
+        return render_game_skeleton_frame(self.current_gesture, keypoints)
 
 
 class JitterEvaluator:
@@ -384,7 +549,7 @@ def build_tracker(backend: str):
         raise ValueError(f"Unsupported backend: {backend}")
 
 
-def resolve_video_io(args) -> Tuple[cv2.VideoCapture, cv2.VideoWriter, str, bool]:
+def resolve_video_io(args) -> Tuple[cv2.VideoCapture, cv2.VideoWriter | None, str | None, bool]:
     is_test_mode = bool(args.testmode)
 
     if is_test_mode:
@@ -398,7 +563,7 @@ def resolve_video_io(args) -> Tuple[cv2.VideoCapture, cv2.VideoWriter, str, bool
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or args.width
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or args.height
-        fps = 20.0
+        fps = cap.get(cv2.CAP_PROP_FPS)
 
         output_path = input_path.with_name(f"{input_path.stem}_{args.filter}_{args.backend}_skeleton.mp4")
     else:
@@ -410,16 +575,20 @@ def resolve_video_io(args) -> Tuple[cv2.VideoCapture, cv2.VideoWriter, str, bool
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         width = args.width
         height = args.height
-        fps = 20.0
+        fps = cap.get(cv2.CAP_PROP_FPS)
         output_path = Path("hand_skeleton_output.mp4")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video_out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-    if not video_out.isOpened():
-        cap.release()
-        raise RuntimeError(f"Cannot create output video: {output_path}")
+    video_out = None
+    if not args.no_save_video:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        if not video_out.isOpened():
+            cap.release()
+            raise RuntimeError(f"Cannot create output video: {output_path}")
+    else:
+        output_path = None
 
-    return cap, video_out, str(output_path), is_test_mode
+    return cap, video_out, (str(output_path) if output_path is not None else None), is_test_mode
 
 
 def main():
@@ -454,6 +623,19 @@ def main():
         choices=["none", "ema", "oneeuro", "kalman"],
         help="Temporal smoothing filter"
     )
+    parser.add_argument(
+        "--game",
+        type=str,
+        default="none",
+        choices=["none", "gripper_win", "gripper_lose"],
+        help="Game response mode: print the computer hand that wins or loses on gesture change.",
+    )
+    parser.add_argument(
+        "--no_save_video",
+        action="store_true",
+        help="Disable saving the output skeleton video.",
+        default=True,
+    )
     args = parser.parse_args()
 
     tracker = build_tracker(args.backend)
@@ -464,6 +646,19 @@ def main():
     prev_time = time.time()
     total_infer_time = 0.0
     frame_count = 0
+    keypoint_classifier = KeyPointClassifier()
+    previous_gesture = None
+    current_computer_gesture = ""
+    current_computer_frame = None
+    game_skeleton_player = GameSkeletonPlayer(
+        load_game_skeleton_animations(Path("game_skeleton"))
+    )
+    keypoint_label_path = Path("model/keypoint_classifier/keypoint_classifier_label.csv")
+    with keypoint_label_path.open(encoding="utf-8-sig") as f:
+        keypoint_classifier_labels = csv.reader(f)
+        keypoint_classifier_labels = [
+            row[0] for row in keypoint_classifier_labels
+        ]
 
     while True:
         ok, frame = cap.read()
@@ -480,6 +675,7 @@ def main():
         # print("raw:", len(predictions))
         predictions = filter_manager.apply(predictions)
         # print("filtered:", len(predictions))
+        
         infer_time = time.time() - start
         total_infer_time += infer_time
         frame_count += 1
@@ -492,9 +688,45 @@ def main():
         filter_manager.update_freq(fps)
 
         vis = frame.copy()
-        # print(predictions)
+        current_gesture = None
         for keypoints, label in predictions:
-            vis = draw_hand_skeleton(vis, keypoints, draw_bbox=True)
+            gesture_label, confidence = classify_hand_sign(
+                keypoints,
+                keypoint_classifier,
+                keypoint_classifier_labels,
+            )
+            current_gesture = gesture_label
+            display_label = gesture_label
+            if label:
+                display_label = f"{label} | {gesture_label}"
+            if confidence > 0:
+                display_label = f"{display_label} ({confidence:.2f})"
+
+            vis = draw_hand_skeleton(
+                vis,
+                keypoints,
+                label=display_label,
+                draw_bbox=True,
+            )
+
+        if current_gesture != previous_gesture:
+            computer_gesture = ""
+            if args.game == "gripper_win":
+                computer_gesture = get_winning_hand(current_gesture or "")
+            elif args.game == "gripper_lose":
+                computer_gesture = get_losing_hand(current_gesture or "")
+
+            if computer_gesture:
+                # game output
+                print(f"Player: {current_gesture} -> Computer: {computer_gesture}")
+                game_skeleton_player.set_gesture(computer_gesture)
+            current_computer_gesture = computer_gesture
+        previous_gesture = current_gesture
+
+        if args.game != "none" and current_computer_gesture:
+            current_computer_frame = game_skeleton_player.get_frame()
+        else:
+            current_computer_frame = None
 
         if args.show_fps:
 
@@ -529,10 +761,25 @@ def main():
                 cv2.LINE_AA,
             )
 
-        video_out.write(vis)
+        if args.game != "none" and current_computer_gesture:
+            cv2.putText(
+                vis,
+                f"Computer: {current_computer_gesture}",
+                (20, 135),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        if video_out is not None:
+            video_out.write(vis)
 
         if not is_test_mode:
             cv2.imshow("Hand Skeleton Realtime", vis)
+            if args.game != "none" and current_computer_frame is not None:
+                cv2.imshow("Computer Gesture", current_computer_frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key in [27, ord("q")]:  # ESC or q
@@ -540,11 +787,15 @@ def main():
 
     tracker.close()
     cap.release()
-    video_out.release()
+    if video_out is not None:
+        video_out.release()
     cv2.destroyAllWindows()
 
     avg_infer_ms = (total_infer_time / frame_count * 1000.0) if frame_count else 0.0
-    print(f"Output video saved to: {output_path}")
+    if output_path is not None:
+        print(f"Output video saved to: {output_path}")
+    else:
+        print("Output video saving disabled.")
     print(f"Average inference time: {avg_infer_ms:.2f} ms over {frame_count} frames")
     if jitter_evaluator is not None:
         jitter_stats = jitter_evaluator.summary()
